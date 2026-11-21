@@ -1,0 +1,781 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <title>F1 Night Pit Lane - Ray Tracing</title>
+  <style>
+    body { background: #111; color: #ccc; font-family: monospace; }
+    canvas { border: 1px solid #444; touch-action: none; }
+    .layout { display: flex; gap: 10px; align-items: flex-start; }
+    .editors { display: flex; flex-direction: column; gap: 10px; }
+    textarea {
+      background: #222;
+      color: #0f0;
+      font: 14px monospace;
+      width: 400px;
+      height: 200px;
+      box-sizing: border-box;
+      white-space: pre;
+    }
+    #shaderError { color: #f66; white-space: pre-wrap; width: 400px; margin: 0; }
+    #fps { margin-top: 4px; color: #888; }
+    .controls { margin-top: 10px; display: flex; flex-direction: column; gap: 5px; }
+    .control-row { display: flex; align-items: center; gap: 10px; }
+    .control-row input[type="range"] { width: 180px; }
+  </style>
+</head>
+
+<body>
+  <h2>HW 7 Ray Tracing: F1 Night Pit Lane</h2>
+
+  <p>Everything on screen is ray traced in the fragment shader: an F1 car built from boxes, ellipsoids and cylinders,
+    a glass sphere, a reflective green cube, a polished checkered floor and a pit-garage backdrop.<br>
+    Drag the canvas to orbit the camera. Edit the shaders on the left and the canvas updates as you type.<br>
+    Sliders: bounce depth, ambient fill, light intensity, surface shininess and glass refractive index.</p>
+
+  <div class="layout">
+    <div class="editors">
+      <div>
+        <b>Vertex Shader</b><br>
+        <textarea id="vertEditor" spellcheck="false"></textarea>
+      </div>
+      <div>
+        <b>Fragment Shader</b><br>
+        <textarea id="fragEditor" spellcheck="false"></textarea>
+      </div>
+      <pre id="shaderError"></pre>
+    </div>
+
+    <div>
+      <canvas id="glcanvas" width="640" height="400"></canvas>
+      <div id="fps">FPS: --</div>
+
+      <div class="controls">
+        <div class="control-row">
+          <label for="bounces">Max Bounces:</label>
+          <input type="range" id="bounces" min="1" max="8" value="5">
+          <span id="bouncesValue">5</span>
+        </div>
+        <div class="control-row">
+          <label for="ambient">Ambient Strength:</label>
+          <input type="range" id="ambient" min="0" max="1" step="0.05" value="0.05">
+          <span id="ambientValue">0.05</span>
+        </div>
+        <div class="control-row">
+          <label for="lightIntensity">Light Intensity:</label>
+          <input type="range" id="lightIntensity" min="0" max="5" step="0.1" value="1.5">
+          <span id="lightIntensityValue">1.5</span>
+        </div>
+        <div class="control-row">
+          <label for="shininess">Shininess:</label>
+          <input type="range" id="shininess" min="8" max="128" step="1" value="48">
+          <span id="shininessValue">48</span>
+        </div>
+        <div class="control-row">
+          <label for="glassIOR">Glass IOR:</label>
+          <input type="range" id="glassIOR" min="1.1" max="2.0" step="0.05" value="1.5">
+          <span id="glassIORValue">1.5</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script id="vertex-shader" type="x-shader/x-vertex">#version 300 es
+in vec2 position;
+void main() {
+    gl_Position = vec4(position, 0.0, 1.0);
+}
+</script>
+
+<script id="fragment-shader" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+
+uniform float u_time;
+uniform vec2 u_resolution;
+uniform int u_maxBounces;
+uniform float u_ambientStrength;
+uniform float u_lightIntensity;
+uniform float u_shininess;
+uniform float u_glassIOR;
+uniform vec2 u_cameraOrbit;
+
+out vec4 fragColor;
+
+const float LIGHT_POWER = 3.0;
+const int NUM_LIGHTS = 3;
+const vec3 LIGHT_POSITIONS[3] = vec3[3](
+    vec3(3.5, 3.5, -2.5),     // warm white key light, front right and high
+    vec3(-4.5, 1.2, -5.5),    // red fill, left side
+    vec3(4.0, 2.5, -9.0)      // blue rim light, behind the car on the right
+);
+const vec3 LIGHT_COLORS[3] = vec3[3](
+    vec3(1.0, 0.96, 0.86),
+    vec3(1.0, 0.18, 0.12),
+    vec3(0.22, 0.42, 1.0)
+);
+const float FLOOR_Y = -2.0;
+const float CHECKER_SIZE = 3.0;
+
+// ---- Pit-lane environment ----
+const float WALL_Z = -15.0;      // garage back wall plane
+const float WALL_TOP = 4.8;      // wall stops here; above it is open night sky
+const vec3 C_BARRIER_RED = vec3(0.60, 0.02, 0.03);
+const vec3 C_BARRIER_WHITE = vec3(0.70);
+
+// ---- F1 car ----
+// CAR is the point on the floor under the middle of the car. Every car part
+// is described relative to it: +x = car's right, +y = up, +z = toward the nose
+// (the nose points at the default camera).
+const vec3 CAR = vec3(0.0, -2.0, -5.5);
+
+// Materials: base color is linear (gamma is applied at the end of main()).
+const vec3 C_RED      = vec3(0.70, 0.02, 0.03);
+const vec3 C_CARBON   = vec3(0.025, 0.025, 0.03);
+const vec3 C_TIRE     = vec3(0.03);
+const vec3 C_RIM      = vec3(0.10, 0.10, 0.11);
+const vec3 C_SILVER   = vec3(0.78, 0.80, 0.84);
+const vec3 C_HELMET   = vec3(0.95, 0.72, 0.04);
+
+struct Ray {
+    vec3 origin;
+    vec3 direction;
+};
+
+struct Sphere {
+    vec3 center;
+    float radius;
+    vec3 color;
+};
+
+struct Cube {
+    vec3 center;
+    float halfSize;
+    vec3 color;
+    float reflectivity;
+};
+
+struct HitData {
+    bool hit;
+    float t;
+    vec3 point;
+    vec3 normal;
+    vec3 color;
+    float reflectivity;
+    bool isLight;
+    bool isGlass;
+    float specStrength;   // how strong the Phong highlight is for this material
+    float shineScale;     // multiplies the global Shininess slider (tires = broad, chrome = tight)
+    float emissive;       // > 0 means the surface glows: it adds color * emissive and ends the ray
+};
+
+const Sphere lightSphere = Sphere(LIGHT_POSITIONS[0], 0.3, vec3(1.0, 1.0, 0.9));   // visible marker for the key light
+Sphere sphere;
+Sphere glassSphere;
+Cube cube;
+
+void initScene(float time) {
+    // The car now owns the middle of the scene, so the Stage 1/2 objects are
+    // moved to its sides. They keep their materials and animation.
+
+    // Glass sphere resting on the floor, front-left of the car.
+    glassSphere = Sphere(vec3(-2.4, -1.15, -4.6), 0.85, vec3(0.82, 0.94, 1.0));
+
+    // Animated red sphere floating to the car's right.
+    float a = time * 0.5;
+    sphere = Sphere(vec3(3.6 + cos(a) * 0.4, -0.7 + sin(a * 1.3) * 0.4, -7.2 + sin(a) * 0.6), 0.6, vec3(1.0, 0.3, 0.3));
+
+    // Reflective green cube hovering behind-left of the car.
+    float b = time * 0.3;
+    cube = Cube(vec3(-3.3 + sin(b) * 0.4, -0.6 + cos(b * 1.5) * 0.4, -8.3 + cos(b * 0.7) * 0.5), 0.8, vec3(0.3, 0.8, 0.3), 0.85);
+}
+
+bool intersectSphere(Ray ray, Sphere s, out float t) {
+    vec3 oc = ray.origin - s.center;
+    float b = dot(oc, ray.direction);
+    float d = b * b - dot(oc, oc) + s.radius * s.radius;
+    if (d < 0.0) return false;
+
+    t = -b - sqrt(d);
+    if (t < 0.001) t = -b + sqrt(d);  // ray starts inside
+    return t > 0.001;
+}
+
+// Axis-aligned BOX intersection using the slab method (the old cube code,
+// generalized so each side can have a different half-extent).
+// The returned normal is the normal of the face that the ray enters (or exits).
+bool intersectBox(Ray ray, vec3 center, vec3 halfExtent, out float t, out vec3 normal) {
+    vec3 invDir = 1.0 / ray.direction;
+    vec3 t0s = (center - halfExtent - ray.origin) * invDir;
+    vec3 t1s = (center + halfExtent - ray.origin) * invDir;
+    vec3 tmin = min(t0s, t1s);
+    vec3 tmax = max(t0s, t1s);
+
+    float tNear = max(max(tmin.x, tmin.y), tmin.z);
+    float tFar = min(min(tmax.x, tmax.y), tmax.z);
+    if (tFar < max(tNear, 0.0)) return false;
+
+    t = tNear > 0.001 ? tNear : tFar;
+    if (t < 0.001) return false;
+
+    // Pick the face the hit point is closest to. Dividing by halfExtent first
+    // makes this work for flat boxes (wings), not only for cubes.
+    vec3 localPoint = ray.origin + ray.direction * t - center;
+    vec3 q = abs(localPoint) / halfExtent;
+    if (q.x >= q.y && q.x >= q.z)
+        normal = vec3(sign(localPoint.x), 0.0, 0.0);
+    else if (q.y >= q.z)
+        normal = vec3(0.0, sign(localPoint.y), 0.0);
+    else
+        normal = vec3(0.0, 0.0, sign(localPoint.z));
+    return true;
+}
+
+// The green cube is just a box whose three half-extents are equal.
+bool intersectCube(Ray ray, out float t, out vec3 normal) {
+    return intersectBox(ray, cube.center, vec3(cube.halfSize), t, normal);
+}
+
+// Ellipsoid = unit sphere stretched by `radii`. Trick: divide the ray by the
+// radii (this "un-stretches" space), intersect a plain unit sphere there, and
+// reuse the same t. The ray direction is NOT re-normalized, which is exactly
+// why t stays valid in the original world space.
+bool intersectEllipsoid(Ray ray, vec3 center, vec3 radii, out float t, out vec3 normal) {
+    vec3 oc = (ray.origin - center) / radii;
+    vec3 rd = ray.direction / radii;
+    float a = dot(rd, rd);
+    float b = dot(oc, rd);
+    float c = dot(oc, oc) - 1.0;
+    float disc = b * b - a * c;
+    if (disc < 0.0) return false;
+
+    float s = sqrt(disc);
+    t = (-b - s) / a;
+    if (t < 0.001) t = (-b + s) / a;   // ray starts inside
+    if (t < 0.001) return false;
+
+    // Gradient of (x/rx)^2 + (y/ry)^2 + (z/rz)^2 = 1 is p / r^2.
+    vec3 p = ray.origin + ray.direction * t - center;
+    normal = normalize(p / (radii * radii));
+    return true;
+}
+
+// Finite cylinder whose axis points along X (all wheels and suspension arms
+// are like this), closed with two flat end caps.
+bool intersectCylinderX(Ray ray, vec3 center, float radius, float halfLen, out float t, out vec3 normal) {
+    vec3 o = ray.origin - center;
+    vec3 d = ray.direction;
+    float best = 1e10;
+    vec3 bestN = vec3(0.0);
+
+    // Curved side: infinite cylinder y^2 + z^2 = r^2, i.e. a 2D circle test
+    // in the (y, z) plane, then reject hits outside the length |x| <= halfLen.
+    float a = d.y * d.y + d.z * d.z;
+    if (a > 1e-8) {
+        float b = o.y * d.y + o.z * d.z;
+        float c = o.y * o.y + o.z * o.z - radius * radius;
+        float disc = b * b - a * c;
+        if (disc >= 0.0) {
+            float s = sqrt(disc);
+            float t0 = (-b - s) / a;
+            float t1 = (-b + s) / a;
+            if (t0 > 0.001 && abs(o.x + d.x * t0) <= halfLen) {
+                best = t0;
+                vec3 p = o + d * t0;
+                bestN = vec3(0.0, p.y, p.z) / radius;
+            } else if (t1 > 0.001 && abs(o.x + d.x * t1) <= halfLen) {
+                best = t1;
+                vec3 p = o + d * t1;
+                bestN = vec3(0.0, p.y, p.z) / radius;
+            }
+        }
+    }
+
+    // End caps: planes x = -halfLen and x = +halfLen, kept only if the hit
+    // lies inside the circle.
+    if (abs(d.x) > 1e-8) {
+        for (int i = 0; i < 2; ++i) {
+            float side = (i == 0) ? -1.0 : 1.0;
+            float tc = (side * halfLen - o.x) / d.x;
+            if (tc > 0.001 && tc < best) {
+                vec3 p = o + d * tc;
+                if (p.y * p.y + p.z * p.z <= radius * radius) {
+                    best = tc;
+                    bestN = vec3(side, 0.0, 0.0);
+                }
+            }
+        }
+    }
+
+    if (best > 1e9) return false;
+    t = best;
+    normal = bestN;
+    return true;
+}
+
+// Cheap yes/no box test used as a bounding volume for the whole car.
+bool hitsAABB(Ray ray, vec3 center, vec3 halfExtent, float tMax) {
+    vec3 invDir = 1.0 / ray.direction;
+    vec3 t0s = (center - halfExtent - ray.origin) * invDir;
+    vec3 t1s = (center + halfExtent - ray.origin) * invDir;
+    vec3 tmin = min(t0s, t1s);
+    vec3 tmax = max(t0s, t1s);
+    float tNear = max(max(tmin.x, tmin.y), tmin.z);
+    float tFar = min(min(tmax.x, tmax.y), tmax.z);
+    return tFar >= max(tNear, 0.0) && tNear < tMax;
+}
+
+// Schlick approximation for Fresnel reflectance.
+// cosine is the angle between the incoming ray and the opposing surface normal.
+float schlick(float cosine, float eta) {
+    float r0 = (1.0 - eta) / (1.0 + eta);
+    r0 *= r0;
+    return r0 + (1.0 - r0) * pow(1.0 - clamp(cosine, 0.0, 1.0), 5.0);
+}
+
+bool intersectFloor(Ray ray, out float t) {
+    if (abs(ray.direction.y) < 0.0001) return false;
+    t = (FLOOR_Y - ray.origin.y) / ray.direction.y;
+    return t > 0.001;
+}
+
+HitData makeHit(Ray ray, float t, vec3 n, vec3 color, float refl, float specS, float shineS) {
+    return HitData(true, t, ray.origin + ray.direction * t, n, color, refl, false, false, specS, shineS, 0.0);
+}
+
+// The three testXxx helpers below intersect one car part (positions are given
+// relative to CAR) and keep it only if it is closer than the best hit so far.
+void testBox(Ray ray, vec3 c, vec3 h, vec3 color, float refl, float specS, float shineS, inout HitData best) {
+    float t; vec3 n;
+    if (intersectBox(ray, CAR + c, h, t, n) && t < best.t)
+        best = makeHit(ray, t, n, color, refl, specS, shineS);
+}
+
+void testEllipsoid(Ray ray, vec3 c, vec3 r, vec3 color, float refl, float specS, float shineS, inout HitData best) {
+    float t; vec3 n;
+    if (intersectEllipsoid(ray, CAR + c, r, t, n) && t < best.t)
+        best = makeHit(ray, t, n, color, refl, specS, shineS);
+}
+
+void testCylX(Ray ray, vec3 c, float r, float halfLen, vec3 color, float refl, float specS, float shineS, inout HitData best) {
+    float t; vec3 n;
+    if (intersectCylinderX(ray, CAR + c, r, halfLen, t, n) && t < best.t)
+        best = makeHit(ray, t, n, color, refl, specS, shineS);
+}
+
+// The whole F1 car. Material arguments are: reflectivity, specular strength,
+// shininess multiplier.
+void intersectCar(Ray ray, inout HitData best) {
+    // Bounding box: if the ray cannot touch this box (or the box is farther
+    // than something we already hit), skip all ~40 car primitives.
+    if (!hitsAABB(ray, CAR + vec3(0.0, 0.58, 0.05), vec3(1.30, 0.62, 2.55), best.t)) return;
+
+    // ---- Body (red painted bodywork is slightly reflective = clear coat) ----
+    testBox(ray, vec3(0.0, 0.17, -0.10), vec3(0.55, 0.04, 1.95), C_CARBON, 0.05, 0.5, 1.0, best);   // floor plank
+    testBox(ray, vec3(0.0, 0.42, -0.05), vec3(0.28, 0.20, 1.20), C_RED, 0.10, 0.9, 1.5, best);      // central tub
+    testEllipsoid(ray, vec3(0.0, 0.42, 0.90), vec3(0.26, 0.20, 0.60), C_RED, 0.10, 0.9, 1.5, best); // shoulders
+    testEllipsoid(ray, vec3(0.0, 0.37, 1.50), vec3(0.17, 0.13, 0.90), C_RED, 0.10, 0.9, 1.5, best); // tapered nose
+
+    // Sidepods, each with a dark air inlet on its front tip.
+    testEllipsoid(ray, vec3(-0.49, 0.38, -0.50), vec3(0.21, 0.20, 1.00), C_RED, 0.10, 0.9, 1.5, best);
+    testEllipsoid(ray, vec3( 0.49, 0.38, -0.50), vec3(0.21, 0.20, 1.00), C_RED, 0.10, 0.9, 1.5, best);
+    testEllipsoid(ray, vec3(-0.49, 0.39,  0.50), vec3(0.13, 0.10, 0.09), C_CARBON, 0.10, 0.6, 1.0, best);
+    testEllipsoid(ray, vec3( 0.49, 0.39,  0.50), vec3(0.13, 0.10, 0.09), C_CARBON, 0.10, 0.6, 1.0, best);
+
+    // Engine cover and airbox behind the driver.
+    testEllipsoid(ray, vec3(0.0, 0.50, -1.15), vec3(0.22, 0.19, 0.95), C_RED, 0.10, 0.9, 1.5, best);
+    testEllipsoid(ray, vec3(0.0, 0.82, -0.45), vec3(0.14, 0.20, 0.40), C_RED, 0.10, 0.9, 1.5, best);
+    testEllipsoid(ray, vec3(0.0, 0.88, -0.07), vec3(0.08, 0.09, 0.05), C_CARBON, 0.10, 0.6, 1.0, best);
+
+    // ---- Cockpit, driver helmet and visor ----
+    testEllipsoid(ray, vec3(0.0, 0.64, 0.25), vec3(0.19, 0.10, 0.42), C_CARBON, 0.20, 1.0, 2.0, best);
+    testEllipsoid(ray, vec3(0.0, 0.76, 0.12), vec3(0.13, 0.13, 0.13), C_HELMET, 0.15, 1.0, 2.0, best);
+    testEllipsoid(ray, vec3(0.0, 0.775, 0.22), vec3(0.095, 0.04, 0.05), C_CARBON, 0.30, 1.0, 3.0, best);
+
+    // ---- Front wing: main plane, raised flap, two endplates, nose pylon ----
+    testBox(ray, vec3(0.0, 0.15, 2.30), vec3(1.00, 0.02, 0.20), C_CARBON, 0.05, 0.5, 1.0, best);
+    testBox(ray, vec3(0.0, 0.25, 2.18), vec3(0.90, 0.015, 0.10), C_CARBON, 0.05, 0.5, 1.0, best);
+    testBox(ray, vec3(-1.02, 0.20, 2.25), vec3(0.02, 0.11, 0.27), C_CARBON, 0.05, 0.5, 1.0, best);
+    testBox(ray, vec3( 1.02, 0.20, 2.25), vec3(0.02, 0.11, 0.27), C_CARBON, 0.05, 0.5, 1.0, best);
+    testBox(ray, vec3(0.0, 0.22, 2.10), vec3(0.035, 0.06, 0.07), C_CARBON, 0.05, 0.5, 1.0, best);
+
+    // ---- Rear wing: support pillar, main plane, flap, two endplates ----
+    testBox(ray, vec3(0.0, 0.72, -2.00), vec3(0.035, 0.13, 0.05), C_CARBON, 0.05, 0.5, 1.0, best);
+    testBox(ray, vec3(0.0, 0.88, -2.05), vec3(0.62, 0.02, 0.20), C_CARBON, 0.05, 0.5, 1.0, best);
+    testBox(ray, vec3(0.0, 0.98, -2.10), vec3(0.62, 0.015, 0.12), C_RED, 0.08, 0.7, 1.2, best);
+    testBox(ray, vec3(-0.64, 0.86, -2.08), vec3(0.02, 0.22, 0.27), C_CARBON, 0.05, 0.5, 1.0, best);
+    testBox(ray, vec3( 0.64, 0.86, -2.08), vec3(0.02, 0.22, 0.27), C_CARBON, 0.05, 0.5, 1.0, best);
+
+    // ---- Four wheels: tire, graphite rim, chrome hub, and two suspension arms.
+    // i = 0,1 are the front wheels (smaller, narrower); i = 2,3 the rear ones.
+    for (int i = 0; i < 4; ++i) {
+        float sx = (i % 2 == 0) ? -1.0 : 1.0;      // left / right
+        bool front = i < 2;
+        float zc = front ? 1.40 : -1.40;           // axle position
+        float R = front ? 0.40 : 0.45;             // tire radius
+        float halfW = front ? 0.20 : 0.26;         // half tire width
+        float xc = sx * 0.95;
+        vec3 wheelCenter = vec3(xc, R, zc);        // y = R so the tire touches the floor
+
+        testCylX(ray, wheelCenter, R, halfW, C_TIRE, 0.0, 0.08, 0.5, best);
+        testCylX(ray, wheelCenter, R * 0.72, halfW + 0.012, C_RIM, 0.35, 0.9, 2.0, best);
+        testCylX(ray, wheelCenter, R * 0.40, halfW + 0.035, C_SILVER, 0.55, 1.0, 2.5, best);
+
+        // Suspension: two thin arms from the chassis (x = 0.10) to the wheel.
+        float yUpper = front ? 0.46 : 0.57;
+        float yLower = front ? 0.28 : 0.33;
+        testCylX(ray, vec3(sx * 0.44, yUpper, zc - 0.10), 0.025, 0.34, C_CARBON, 0.20, 0.8, 1.5, best);
+        testCylX(ray, vec3(sx * 0.44, yLower, zc + 0.10), 0.025, 0.34, C_CARBON, 0.20, 0.8, 1.5, best);
+    }
+}
+
+// Procedural paint for the garage wall. Everything is decided from the hit
+// point alone, so the wall is a single plane intersection but looks like a row
+// of lit pit-garage bays. Bays repeat every 8 units along x.
+void wallSurface(vec3 p, out vec3 color, out float emissive, out float refl) {
+    color = vec3(0.04, 0.042, 0.05);   // concrete pillar between bays
+    emissive = 0.0;
+    refl = 0.04;
+
+    float height = p.y - FLOOR_Y;                  // 0 at the floor
+    float bay = floor((p.x + 4.0) / 8.0);
+    float lx = mod(p.x + 4.0, 8.0) - 4.0;          // x inside this bay, -4..4
+    float id = mod(bay, 3.0);                      // cycles red / warm white / blue
+    vec3 accent = id < 0.5 ? vec3(1.0, 0.10, 0.06)
+                : (id < 1.5 ? vec3(1.0, 0.88, 0.68) : vec3(0.12, 0.32, 1.0));
+
+    if (abs(lx) < 3.4) {
+        if (height < 4.2) color = vec3(0.010, 0.012, 0.018);                 // dark open garage bay
+        if (height > 1.1 && height < 1.25) { color = accent; emissive = 2.0; }               // colored strip
+        if (height > 3.6 && height < 4.0 && abs(lx) < 2.6) { color = vec3(1.0, 0.93, 0.80); emissive = 1.8; } // ceiling light panel
+        if (height > 4.7 && height < 5.9 && abs(lx) < 2.8) { color = accent * 0.9; emissive = 1.2; }         // sign panel
+    } else if (abs(lx) < 3.46) {
+        color = vec3(0.9); emissive = 1.0;                                  // thin lit frame around each bay
+    }
+}
+
+// Pit-lane environment: back wall, striped barriers, glowing strips and
+// overhead light bars. Writes into `hit` only where it is closer.
+void intersectEnvironment(Ray ray, inout HitData hit) {
+    float t; vec3 n;
+
+    // Back wall: a plane at z = WALL_Z facing +z, cut off at WALL_TOP.
+    if (ray.direction.z < 0.0) {
+        float tw = (WALL_Z - ray.origin.z) / ray.direction.z;
+        if (tw > 0.001 && tw < hit.t) {
+            vec3 p = ray.origin + ray.direction * tw;
+            if (p.y < WALL_TOP) {
+                vec3 c; float em; float rf;
+                wallSurface(p, c, em, rf);
+                hit = HitData(true, tw, p, vec3(0.0, 0.0, 1.0), c, rf, false, false, 0.3, 1.0, em);
+            }
+        }
+    }
+
+    // Two long low barriers: one in front of the garage, one at the camera side.
+    // Each is a stretched box colored in alternating red/white blocks by its x
+    // position, with a thin emissive strip laid along its top edge.
+    for (int k = 0; k < 2; ++k) {
+        float z = (k == 0) ? -13.5 : 3.5;
+        vec3 strip = (k == 0) ? vec3(1.0, 0.10, 0.06) : vec3(0.15, 0.40, 1.0);
+
+        if (intersectBox(ray, vec3(0.0, -1.6, z), vec3(40.0, 0.40, 0.25), t, n) && t < hit.t) {
+            vec3 p = ray.origin + ray.direction * t;
+            vec3 c = (mod(floor(p.x / 1.5), 2.0) < 1.0) ? C_BARRIER_RED : C_BARRIER_WHITE;
+            hit = HitData(true, t, p, n, c, 0.08, false, false, 0.6, 1.2, 0.0);
+        }
+        if (intersectBox(ray, vec3(0.0, -1.19, z), vec3(40.0, 0.02, 0.18), t, n) && t < hit.t) {
+            hit = HitData(true, t, ray.origin + ray.direction * t, n, strip, 0.0, false, false, 0.0, 1.0, 2.5);
+        }
+    }
+
+    // Overhead light bars. They glow and show up in the car's paint and the
+    // floor reflections (they do not act as extra point lights).
+    for (int k = 0; k < 2; ++k) {
+        float z = (k == 0) ? -7.0 : -3.0;
+        if (intersectBox(ray, vec3(0.0, 3.6, z), vec3(5.0, 0.05, 0.10), t, n) && t < hit.t) {
+            hit = HitData(true, t, ray.origin + ray.direction * t, n, vec3(1.0, 0.95, 0.85), 0.0, false, false, 0.0, 1.0, 3.0);
+        }
+    }
+}
+
+HitData traceScene(Ray ray, bool includeLight) {
+    HitData hit;
+    hit.hit = false;
+    hit.t = 1e10;
+    float t;
+    vec3 n;
+
+    if (includeLight && intersectSphere(ray, lightSphere, t) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, vec3(0.0), lightSphere.color, 0.0, true, false, 0.0, 1.0, 0.0);
+    }
+
+    if (intersectFloor(ray, t) && t < hit.t) {
+        vec3 p = ray.origin + ray.direction * t;
+        vec2 cell = floor(p.xz / CHECKER_SIZE);
+        // Night-time checker: dim light tiles and near-black dark tiles.
+        vec3 color = mod(cell.x + cell.y, 2.0) < 1.0 ? vec3(0.30) : vec3(0.03);
+
+        // Yellow pit-box outline painted around the car (rectangle edge test).
+        vec2 edge = abs(p.xz - CAR.xz) - vec2(2.4, 3.0);
+        if (abs(max(edge.x, edge.y)) < 0.05) color = vec3(0.85, 0.60, 0.02);
+
+        // Fade the far checker to a flat average to hide aliasing near the horizon.
+        color = mix(color, vec3(0.12), smoothstep(20.0, 55.0, t));
+
+        // Polished floor: 20% mirror reflection.
+        hit = HitData(true, t, p, vec3(0.0, 1.0, 0.0), color, 0.20, false, false, 0.8, 1.5, 0.0);
+    }
+
+    if (intersectCube(ray, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n, cube.color, cube.reflectivity, false, false, 0.65, 1.0, 0.0);
+    }
+
+    if (intersectSphere(ray, sphere, t) && t < hit.t) {
+        vec3 p = ray.origin + ray.direction * t;
+        hit = HitData(true, t, p, (p - sphere.center) / sphere.radius, sphere.color, 0.0, false, false, 0.65, 1.0, 0.0);
+    }
+
+    if (intersectSphere(ray, glassSphere, t) && t < hit.t) {
+        vec3 p = ray.origin + ray.direction * t;
+        vec3 outwardNormal = (p - glassSphere.center) / glassSphere.radius;
+        hit = HitData(true, t, p, outwardNormal, glassSphere.color, 0.0, false, true, 0.65, 1.0, 0.0);
+    }
+
+    intersectEnvironment(ray, hit);
+
+    // The car goes last so its bounding-box test can use the closest hit so far.
+    intersectCar(ray, hit);
+
+    return hit;
+}
+
+// Evaluate direct Phong lighting from every point light. Each light casts
+// its own shadow ray, so objects can correctly occlude individual lights.
+vec3 phongLighting(HitData hit, Ray incomingRay) {
+    vec3 normal = normalize(hit.normal);
+    vec3 viewDir = normalize(-incomingRay.direction);
+    vec3 ambient = hit.color * u_ambientStrength;
+    vec3 direct = vec3(0.0);
+
+    for (int i = 0; i < NUM_LIGHTS; ++i) {
+        vec3 toLight = LIGHT_POSITIONS[i] - hit.point;
+        float lightDist = length(toLight);
+        vec3 lightDir = toLight / max(lightDist, 0.0001);
+
+        // A surface facing away from the light gets nothing from it, so the
+        // (expensive) shadow ray can be skipped entirely.
+        float diffuse = max(dot(normal, lightDir), 0.0);
+        if (diffuse <= 0.0) continue;
+
+        // Shadow ray. Offset the origin slightly to avoid self-intersection.
+        // Glowing fixtures (light bars, strips) never block light, and glass
+        // only dims it with a cool tint instead of casting a solid shadow.
+        Ray shadowRay = Ray(hit.point + normal * 0.002, lightDir);
+        HitData blocker = traceScene(shadowRay, false);
+        vec3 visible = vec3(1.0);
+        if (blocker.hit && blocker.t < lightDist && blocker.emissive <= 0.0) {
+            visible = blocker.isGlass ? vec3(0.50, 0.62, 0.72) : vec3(0.0);
+        }
+
+        vec3 reflectedLight = reflect(-lightDir, normal);
+        float specular = pow(max(dot(viewDir, reflectedLight), 0.0), u_shininess * hit.shineScale);
+        float attenuation = 1.0 / (1.0 + 0.08 * lightDist + 0.025 * lightDist * lightDist);
+
+        vec3 diffuseTerm = hit.color * diffuse;
+        vec3 specularTerm = vec3(specular) * hit.specStrength;
+        direct += (diffuseTerm + specularTerm) * LIGHT_COLORS[i]
+                  * u_lightIntensity * attenuation * visible;
+    }
+
+    return ambient + direct;
+}
+
+vec3 trace(Ray ray) {
+    vec3 color = vec3(0.0);
+    vec3 attenuation = vec3(1.0);
+
+    // GLSL does not support recursive function calls, so each bounce is
+    // represented by another iteration of this loop.
+    for (int bounce = 0; bounce < u_maxBounces; ++bounce) {
+        HitData hit = traceScene(ray, true);
+
+        if (!hit.hit) {
+            float t = 0.5 * (ray.direction.y + 1.0);
+            color += attenuation * mix(vec3(0.008, 0.010, 0.022), vec3(0.04, 0.05, 0.09), t);   // night sky
+            break;
+        }
+
+        if (hit.isLight) {
+            color += attenuation * hit.color * LIGHT_POWER * u_lightIntensity;
+            break;
+        }
+
+        // Glowing surfaces (light bars, wall panels, barrier strips) emit light
+        // directly and end the ray, just like the visible light sphere.
+        if (hit.emissive > 0.0) {
+            color += attenuation * hit.color * hit.emissive;
+            break;
+        }
+
+        // Glass uses Schlick Fresnel to select the dominant secondary ray.
+        // This deterministic approximation avoids the noise of stochastic sampling.
+        if (hit.isGlass) {
+            vec3 outwardNormal = normalize(hit.normal);
+            bool entering = dot(ray.direction, outwardNormal) < 0.0;
+            vec3 normal = entering ? outwardNormal : -outwardNormal;
+            float eta = entering ? (1.0 / u_glassIOR) : u_glassIOR;
+            float cosTheta = clamp(dot(-ray.direction, normal), 0.0, 1.0);
+
+            vec3 refractedDir = refract(ray.direction, normal, eta);
+            bool totalInternalReflection = dot(refractedDir, refractedDir) < 0.000001;
+            float fresnel = totalInternalReflection ? 1.0 : schlick(cosTheta, u_glassIOR);
+
+            if (totalInternalReflection || fresnel > 0.5) {
+                vec3 reflectedDir = normalize(reflect(ray.direction, normal));
+                ray = Ray(hit.point + normal * 0.003, reflectedDir);
+            } else {
+                // A very subtle cool tint suggests real glass without obscuring the scene.
+                attenuation *= vec3(0.985, 0.995, 1.0);
+                ray = Ray(hit.point - normal * 0.003, normalize(refractedDir));
+            }
+            continue;
+        }
+
+        vec3 localColor = phongLighting(hit, ray);
+        color += attenuation * localColor * (1.0 - hit.reflectivity);
+
+        if (hit.reflectivity <= 0.001) break;
+
+        attenuation *= hit.reflectivity;
+        vec3 reflectedDir = normalize(reflect(ray.direction, normalize(hit.normal)));
+        ray = Ray(hit.point + normalize(hit.normal) * 0.002, reflectedDir);
+    }
+
+    return color;
+}
+
+void main() {
+    initScene(u_time);
+
+    // Orbit camera around the scene center
+    float cp = cos(u_cameraOrbit.x), sp = sin(u_cameraOrbit.x);
+    float cy = cos(u_cameraOrbit.y), sy = sin(u_cameraOrbit.y);
+    mat3 rotX = mat3(1.0, 0.0, 0.0,  0.0, cp, -sp,  0.0, sp, cp);
+    mat3 rotY = mat3(cy, 0.0, -sy,  0.0, 1.0, 0.0,  sy, 0.0, cy);
+    mat3 camera = rotY * rotX;
+
+    vec3 target = vec3(0.0, -1.1, -5.5);   // orbit around the car
+    vec2 uv = (gl_FragCoord.xy - 0.5 * u_resolution) / u_resolution.y;
+    Ray ray = Ray(target + camera * vec3(0.0, 0.0, 7.0), camera * normalize(vec3(uv, -1.5)));
+
+    vec3 color = trace(ray);
+
+    // Filmic (ACES approximation) tone mapping: bright glowing strips roll off
+    // smoothly instead of clipping, and shadows keep more contrast.
+    color = clamp((color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14), 0.0, 1.0);
+
+    // Gentle vignette darkens the corners for a cinematic look.
+    vec2 q = gl_FragCoord.xy / u_resolution;
+    color *= 0.6 + 0.4 * pow(16.0 * q.x * q.y * (1.0 - q.x) * (1.0 - q.y), 0.3);
+
+    fragColor = vec4(pow(color, vec3(1.0 / 2.2)), 1.0);  // gamma correction
+}
+</script>
+
+<script>
+  const canvas = document.getElementById("glcanvas");
+  const gl = canvas.getContext("webgl2");
+
+  function compile(type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(shader));
+    return shader;
+  }
+
+  function createProgram(vsSource, fsSource) {
+    const prog = gl.createProgram();
+    gl.attachShader(prog, compile(gl.VERTEX_SHADER, vsSource));
+    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fsSource));
+    gl.bindAttribLocation(prog, 0, "position");
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    return prog;
+  }
+
+  const vertEditor = document.getElementById("vertEditor");
+  const fragEditor = document.getElementById("fragEditor");
+  const shaderError = document.getElementById("shaderError");
+  vertEditor.value = document.getElementById("vertex-shader").textContent;
+  fragEditor.value = document.getElementById("fragment-shader").textContent;
+
+  let program;
+  function updateProgram() {
+    try {
+      const prog = createProgram(vertEditor.value, fragEditor.value);
+      gl.deleteProgram(program);
+      program = prog;
+      gl.useProgram(program);
+      shaderError.textContent = "";
+    } catch (e) {
+      shaderError.textContent = e.message.replace(/\0/g, "");
+    }
+  }
+  updateProgram();
+  vertEditor.addEventListener("input", updateProgram);
+  fragEditor.addEventListener("input", updateProgram);
+
+  gl.bindVertexArray(gl.createVertexArray());
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.enableVertexAttribArray(0);
+
+  const bounces = document.getElementById("bounces");
+  const ambient = document.getElementById("ambient");
+  const lightIntensity = document.getElementById("lightIntensity");
+  const shininess = document.getElementById("shininess");
+  const glassIOR = document.getElementById("glassIOR");
+  for (const slider of [bounces, ambient, lightIntensity, shininess, glassIOR]) {
+    slider.addEventListener("input", () => document.getElementById(slider.id + "Value").textContent = slider.value);
+  }
+
+  // Dragging orbits the camera
+  let pitch = 0.2, yaw = 0.5;   // start with a front three-quarter view of the car
+  canvas.addEventListener("pointerdown", e => canvas.setPointerCapture(e.pointerId));
+  canvas.addEventListener("pointermove", e => {
+    if (!canvas.hasPointerCapture(e.pointerId)) return;
+    yaw -= e.movementX * 0.01;
+    pitch = Math.min(1.4, Math.max(0.0, pitch + e.movementY * 0.01));  // min 0 keeps the camera above the floor
+  });
+
+  let lastTime = 0, fpsSmooth = 0;
+  function render(time) {
+    requestAnimationFrame(render);
+    if (!program) return;
+
+    // FPS
+    if (lastTime > 0) {
+      fpsSmooth = fpsSmooth * 0.9 + (1000 / Math.max(time - lastTime, 1)) * 0.1;
+      document.getElementById("fps").textContent = "FPS: " + fpsSmooth.toFixed(0);
+    }
+    lastTime = time;
+
+    const uniform = name => gl.getUniformLocation(program, name);
+    gl.uniform1f(uniform("u_time"), time / 1000);
+    gl.uniform2f(uniform("u_resolution"), canvas.width, canvas.height);
+    gl.uniform1i(uniform("u_maxBounces"), bounces.value);
+    gl.uniform1f(uniform("u_ambientStrength"), ambient.value);
+    gl.uniform1f(uniform("u_lightIntensity"), lightIntensity.value);
+    gl.uniform1f(uniform("u_shininess"), shininess.value);
+    gl.uniform1f(uniform("u_glassIOR"), glassIOR.value);
+    gl.uniform2f(uniform("u_cameraOrbit"), pitch, yaw);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+  requestAnimationFrame(render);
+</script>
+</body>
+
+</html>
