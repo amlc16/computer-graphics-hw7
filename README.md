@@ -1,6 +1,6 @@
 # HW7: F1 Night Pit Lane (WebGL2 Ray Tracer)
 
-**Live demo:** https://YOUR_USERNAME.github.io/YOUR_REPO/hw7.html
+**Live demo:** https://amlc15.github.io/computer-graphics-hw7/hw7.html
 
 A real-time ray tracer written as a single HTML file (`hw7.html`). Everything on screen is traced in the fragment shader; the only rasterized geometry is a full-screen quad. Runs at about 60 FPS on my machine at 640x400.
 
